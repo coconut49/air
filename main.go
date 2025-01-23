@@ -6,15 +6,18 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
+	"runtime/debug"
 	"syscall"
 
-	"github.com/cosmtrek/air/runner"
+	"github.com/air-verse/air/runner"
 )
 
 var (
 	cfgPath     string
 	debugMode   bool
 	showVersion bool
+	cmdArgs     map[string]runner.TomlInfo
 )
 
 func helpMessage() {
@@ -28,34 +31,77 @@ func helpMessage() {
 }
 
 func init() {
+	parseFlag(os.Args[1:])
+}
+
+func parseFlag(args []string) {
 	flag.Usage = helpMessage
 	flag.StringVar(&cfgPath, "c", "", "config path")
 	flag.BoolVar(&debugMode, "d", false, "debug mode")
 	flag.BoolVar(&showVersion, "v", false, "show version")
-	flag.Parse()
+	cmd := flag.CommandLine
+	cmdArgs = runner.ParseConfigFlag(cmd)
+	if err := flag.CommandLine.Parse(args); err != nil {
+		log.Fatal(err)
+	}
 }
 
-func main() {
+type versionInfo struct {
+	airVersion string
+	goVersion  string
+}
+
+func GetVersionInfo() versionInfo { //revive:disable:unexported-return
+	if len(airVersion) != 0 && len(goVersion) != 0 {
+		return versionInfo{
+			airVersion: airVersion,
+			goVersion:  goVersion,
+		}
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		return versionInfo{
+			airVersion: info.Main.Version,
+			goVersion:  runtime.Version(),
+		}
+	}
+	return versionInfo{
+		airVersion: "(unknown)",
+		goVersion:  runtime.Version(),
+	}
+}
+
+func printSplash() {
+	versionInfo := GetVersionInfo()
 	fmt.Printf(`
   __    _   ___  
  / /\  | | | |_) 
 /_/--\ |_| |_| \_ %s, built with Go %s
 
-`, airVersion, goVersion)
+`, versionInfo.airVersion, versionInfo.goVersion)
+}
 
+func main() {
 	if showVersion {
+		printSplash()
 		return
 	}
-
-	if debugMode {
-		fmt.Println("[debug] mode")
-	}
-
 	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
 	var err error
-	r, err := runner.NewEngine(cfgPath, debugMode)
+	cfg, err := runner.InitConfig(cfgPath)
+	if err != nil {
+		log.Fatal(err)
+		return
+	}
+	cfg.WithArgs(cmdArgs)
+	if !cfg.Log.Silent {
+		printSplash()
+	}
+	if debugMode && !cfg.Log.Silent {
+		fmt.Println("[debug] mode")
+	}
+	r, err := runner.NewEngineWithConfig(cfg, debugMode)
 	if err != nil {
 		log.Fatal(err)
 		return

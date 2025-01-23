@@ -1,9 +1,21 @@
 package runner
 
 import (
-	"io/ioutil"
+	"errors"
+	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"strconv"
+	"strings"
+	"syscall"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestIsDirRootPath(t *testing.T) {
@@ -74,7 +86,7 @@ func TestFileChecksum(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			f, err := ioutil.TempFile("", "")
+			f, err := os.CreateTemp("", "")
 			if err != nil {
 				t.Fatalf("couldn't create temp file for test: %v", err)
 			}
@@ -123,4 +135,186 @@ func TestChecksumMap(t *testing.T) {
 	if !m.updateFileChecksum("bar.txt", "123456") {
 		t.Errorf("expected no entry for bar.txt, but had one")
 	}
+}
+
+func TestAdaptToVariousPlatforms(t *testing.T) {
+	config := &Config{
+		Build: cfgBuild{
+			Bin: "tmp\\main.exe  -dev",
+		},
+	}
+	adaptToVariousPlatforms(config)
+	if config.Build.Bin != "tmp\\main.exe  -dev" {
+		t.Errorf("expected '%s' but got '%s'", "tmp\\main.exe  -dev", config.Build.Bin)
+	}
+}
+
+func Test_killCmd_no_process(t *testing.T) {
+	e := Engine{
+		config: &Config{
+			Build: cfgBuild{
+				SendInterrupt: false,
+			},
+		},
+	}
+	_, err := e.killCmd(&exec.Cmd{
+		Process: &os.Process{
+			Pid: 9999,
+		},
+	})
+	if err == nil {
+		t.Errorf("expected error but got none")
+	}
+	if !errors.Is(err, syscall.ESRCH) {
+		t.Errorf("expected '%s' but got '%s'", syscall.ESRCH, errors.Unwrap(err))
+	}
+}
+
+func Test_killCmd_SendInterrupt_false(t *testing.T) {
+	_, b, _, _ := runtime.Caller(0)
+
+	// Root folder of this project
+	dir := filepath.Dir(b)
+	err := os.Chdir(dir)
+	if err != nil {
+		t.Fatalf("couldn't change directory: %v", err)
+	}
+
+	// clean file before test
+	os.Remove("pid")
+	defer os.Remove("pid")
+	e := Engine{
+		config: &Config{
+			Build: cfgBuild{
+				SendInterrupt: false,
+			},
+		},
+	}
+	startChan := make(chan struct {
+		pid int
+		cmd *exec.Cmd
+	})
+	go func() {
+		cmd, _, _, err := e.startCmd("sh _testdata/run-many-processes.sh")
+		if err != nil {
+			t.Errorf("failed to start command: %v", err)
+			return
+		}
+		pid := cmd.Process.Pid
+		t.Logf("process pid is %v", pid)
+		startChan <- struct {
+			pid int
+			cmd *exec.Cmd
+		}{pid: pid, cmd: cmd}
+		if err := cmd.Wait(); err != nil {
+			t.Logf("failed to wait command: %v", err)
+		}
+		t.Logf("wait finished")
+	}()
+	resp := <-startChan
+	t.Logf("process started. checking pid %v", resp.pid)
+	time.Sleep(2 * time.Second)
+	t.Logf("%v", resp.cmd.Process.Pid)
+	pid, _ := e.killCmd(resp.cmd)
+	t.Logf("%v was been killed", pid)
+	// check processes were being killed
+	// read pids from file
+	bytesRead, err := os.ReadFile("pid")
+	require.NoError(t, err)
+	lines := strings.Split(string(bytesRead), "\n")
+	for _, line := range lines {
+		_, err := strconv.Atoi(line)
+		if err != nil {
+			t.Logf("failed to convert str to int %v", err)
+			continue
+		}
+		_, err = exec.Command("ps", "-p", line, "-o", "comm= ").Output()
+		if err == nil {
+			t.Fatalf("process should be killed %v", line)
+		}
+	}
+}
+
+func TestGetStructureFieldTagMap(t *testing.T) {
+	c := Config{}
+	tagMap := flatConfig(c)
+	assert.NotEmpty(t, tagMap)
+	for _, i2 := range tagMap {
+		fmt.Printf("%v\n", i2.fieldPath)
+	}
+}
+
+func TestSetStructValue(t *testing.T) {
+	c := Config{}
+	v := reflect.ValueOf(&c)
+	setValue2Struct(v, "TmpDir", "asdasd")
+	assert.Equal(t, "asdasd", c.TmpDir)
+}
+
+func TestNestStructValue(t *testing.T) {
+	c := Config{}
+	v := reflect.ValueOf(&c)
+	setValue2Struct(v, "Build.Cmd", "asdasd")
+	assert.Equal(t, "asdasd", c.Build.Cmd)
+}
+
+func TestNestStructArrayValue(t *testing.T) {
+	c := Config{}
+	v := reflect.ValueOf(&c)
+	setValue2Struct(v, "Build.ExcludeDir", "dir1,dir2")
+	assert.Equal(t, []string{"dir1", "dir2"}, c.Build.ExcludeDir)
+}
+
+func TestNestStructArrayValueOverride(t *testing.T) {
+	c := Config{
+		Build: cfgBuild{
+			ExcludeDir: []string{"default1", "default2"},
+		},
+	}
+	v := reflect.ValueOf(&c)
+	setValue2Struct(v, "Build.ExcludeDir", "dir1,dir2")
+	assert.Equal(t, []string{"dir1", "dir2"}, c.Build.ExcludeDir)
+}
+
+func TestCheckIncludeFile(t *testing.T) {
+	e := Engine{
+		config: &Config{
+			Build: cfgBuild{
+				IncludeFile: []string{"main.go"},
+			},
+		},
+	}
+	assert.True(t, e.checkIncludeFile("main.go"))
+	assert.False(t, e.checkIncludeFile("no.go"))
+	assert.False(t, e.checkIncludeFile("."))
+}
+
+func TestJoinPathRelative(t *testing.T) {
+	root, err := filepath.Abs("test")
+
+	if err != nil {
+		t.Fatalf("couldn't get absolute path for testing: %v", err)
+	}
+
+	result := joinPath(root, "x")
+
+	assert.Equal(t, result, filepath.Join(root, "x"))
+}
+
+func TestJoinPathAbsolute(t *testing.T) {
+	root, err := filepath.Abs("test")
+
+	if err != nil {
+		t.Fatalf("couldn't get absolute path for testing: %v", err)
+	}
+
+	path, err := filepath.Abs("x")
+
+	if err != nil {
+		t.Fatalf("couldn't get absolute path for testing: %v", err)
+	}
+
+	result := joinPath(root, path)
+
+	assert.Equal(t, result, path)
 }

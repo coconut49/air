@@ -1,12 +1,13 @@
+//go:build unix && !linux
+
 package runner
 
 import (
 	"io"
+	"os"
 	"os/exec"
 	"syscall"
 	"time"
-
-	"github.com/creack/pty"
 )
 
 func (e *Engine) killCmd(cmd *exec.Cmd) (pid int, err error) {
@@ -17,7 +18,7 @@ func (e *Engine) killCmd(cmd *exec.Cmd) (pid int, err error) {
 		if err = syscall.Kill(-pid, syscall.SIGINT); err != nil {
 			return
 		}
-		time.Sleep(e.config.Build.KillDelay * time.Millisecond)
+		time.Sleep(e.config.killDelay())
 	}
 	// https://stackoverflow.com/questions/22470193/why-wont-go-kill-a-child-process-correctly
 	err = syscall.Kill(-pid, syscall.SIGKILL)
@@ -28,6 +29,26 @@ func (e *Engine) killCmd(cmd *exec.Cmd) (pid int, err error) {
 
 func (e *Engine) startCmd(cmd string) (*exec.Cmd, io.ReadCloser, io.ReadCloser, error) {
 	c := exec.Command("/bin/sh", "-c", cmd)
-	f, err := pty.Start(c)
-	return c, f, f, err
+	// because using pty cannot have same pgid
+	c.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true,
+	}
+
+	stderr, err := c.StderrPipe()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	stdout, err := c.StdoutPipe()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	c.Stdout = os.Stdout
+	c.Stderr = os.Stderr
+
+	err = c.Start()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return c, stdout, stderr, nil
 }

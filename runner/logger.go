@@ -26,12 +26,12 @@ var (
 type logFunc func(string, ...interface{})
 
 type logger struct {
-	config  *config
+	config  *Config
 	colors  map[string]string
 	loggers map[string]logFunc
 }
 
-func newLogger(cfg *config) *logger {
+func newLogger(cfg *Config) *logger {
 	if cfg == nil {
 		return nil
 	}
@@ -53,7 +53,10 @@ func newLogFunc(colorname string, cfg cfgLog) logFunc {
 	return func(msg string, v ...interface{}) {
 		// There are some escape sequences to format color in terminal, so cannot
 		// just trim new line from right.
-		msg = strings.Replace(msg, "\n", "", -1)
+		if cfg.Silent {
+			return
+		}
+		msg = strings.ReplaceAll(msg, "\n", "")
 		msg = strings.TrimSpace(msg)
 		if len(msg) == 0 {
 			return
